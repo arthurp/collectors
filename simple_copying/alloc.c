@@ -1,4 +1,5 @@
 #include "alloc.h"
+#include "shadowstack.h"
 
 #include <gc/gc.h>
 #include <stdio.h>
@@ -96,10 +97,7 @@ inline static void* scanptr(void** p, void* next_alloc_pointer) {
 }
 
 int alloc_collect() {
-  //char dummy;
-
-  Force GCC to spill all registers.
-
+#ifdef DIRECT_STACK_SCAN
   // scan stack
   void* stack_start = __builtin_frame_address(0); //&dummy + 1; 
   void* stack_end = stack_base;
@@ -114,6 +112,16 @@ int alloc_collect() {
 
   for(void** p = stack_start; p < (void**)stack_end; p++) {
     next_alloc_pointer = scanptr(p, next_alloc_pointer);
+  }
+#endif
+  void* next_alloc_pointer = nextspace;
+
+  // Scan Shadow stack
+  for(shadow_stack_frame* frame = shadow_stack_top; frame != NULL; frame = frame->prev) {
+    for(int i = 0; i < frame->length; i++) {
+      void* p = frame->elements[i];
+      next_alloc_pointer = scanptr(p, next_alloc_pointer);    
+    }
   }
 
   // scan saved objects from roots
@@ -145,9 +153,14 @@ void alloc_printstat() {
 void* alloc(unsigned long int n) {
   void* p = alloc_pointer + TAG_SIZE;
   p = (void*)(((uintptr_t)p + alloc_align) & ~(alloc_align-1));
-  TAG_OF_PTR(p) = TAG_FROM_SIZE(n);
 
   alloc_pointer = p + n;
-  assert(alloc_pointer < currentspace_end);
+  if(alloc_pointer > currentspace_end) {
+    alloc_collect();
+    return alloc(n);
+  }
+
+  TAG_OF_PTR(p) = TAG_FROM_SIZE(n);
+
   return p;
 }
