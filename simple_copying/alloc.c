@@ -98,6 +98,8 @@ inline static void* scanptr(void** p, void* next_alloc_pointer) {
 int alloc_collect() {
   //char dummy;
 
+  Force GCC to spill all registers.
+
   // scan stack
   void* stack_start = __builtin_frame_address(0); //&dummy + 1; 
   void* stack_end = stack_base;
@@ -106,7 +108,7 @@ int alloc_collect() {
   assert((uintptr_t)stack_end % sizeof(void*) == 0);
   assert((uintptr_t)stack_start % sizeof(void*) == 0);
 
-  printf("Scanning stack: %p - %p\n", stack_start, stack_end);
+  printf("Scanning stack: %p - (%p) %p\n", stack_start, &stack_start, stack_end);
 
   void* next_alloc_pointer = nextspace;
 
