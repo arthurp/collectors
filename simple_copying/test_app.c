@@ -137,7 +137,7 @@ void recursive_test(long int n, int d) {
 
 
 int main(int argc, char* argv[]) {
-  alloc_init(10*1000);
+  alloc_init(1*1000*1000);
   alloc_printstat();
 
   /*allocation_stress(1000);
