@@ -9,6 +9,8 @@
 #include <assert.h>
 #include <string.h>
 
+#include <pthread.h>
+
 const int alloc_align = 16;
 
 #define TAG_SIZE 8 // 1 word
@@ -29,35 +31,89 @@ const int alloc_align = 16;
 #define ROUNDUP_PTR(p) (void*)(((uintptr_t)p + alloc_align) & ~(alloc_align-1))
 
 
-__thread void* stack_base;
+#define MAX_THREADS 32
 
-void* currentspace;
-void* alloc_pointer;
-void* currentspace_end;
 
-void* nextspace;
-void* nextspace_end;
+#define STATE_MUTATING 0 // Normal mutator computation
+#define STATE_WAITING_FOR_COLLECTION 1 // Waiting all threads to stop and collect (Only the master goes into this state)
+#define STATE_WAITING_FOR_HEAPS 2 // Waiting for the master to divide the heap up (only slaves)
+#define STATE_SCANNING 4 // Actual scanning and copying this is parallel work.
+#define STATE_DONE 5 // Done copying, once all threads are in this state they will all go back to MUTATING
 
-int alloc_init(size_t heap_size) {
+typedef struct {
+  void* alloc_ptr;
+  void* alloc_end;
 
-  // Find the stack.
-  struct GC_stack_base stb;
-  int ret = GC_get_stack_base(&stb);
-  stack_base = stb.mem_base;
-  printf("Stack base is %p (current frame is around %p)\n", stack_base, &ret);
+  void* stack_base;
+
+  volatile int state;
+} local_heap_t;
+
+__thread local_heap_t local_heap = {0,};
+
+#define STATE_NOT_COLLECTING 0
+#define STATE_COLLECTION_NEEDED 1
+#define STATE_HEAPS_SET 2
+
+typedef struct { 
+  volatile int collection_needed;
+
+  /* Protected by init_lock */
+  void* currentspace;
+  void* currentspace_end;
+  
+  void* nextspace;
+  void* nextspace_end;
+
+  local_heap_t *thread_heap[MAX_THREADS];
+} global_heap_t;
+
+global_heap_t heap = {0,NULL,};
+pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void alloc_init_global(size_t heap_size) {
+  if( heap.currentspace != NULL ) 
+    return;
 
   // Allocate our heap.
   int pagesize = getpagesize();
   heap_size = heap_size + (pagesize - heap_size % pagesize);
-  currentspace = memalign(pagesize, heap_size*2);
-  currentspace_end = currentspace + heap_size;
+  heap.currentspace = memalign(pagesize, heap_size*2);
+  heap.currentspace_end = heap.currentspace + heap_size;
 
-  nextspace = currentspace + heap_size;
-  nextspace_end = nextspace + heap_size;
+  heap.nextspace = heap.currentspace + heap_size;
+  heap.nextspace_end = heap.nextspace + heap_size;
 
-  alloc_pointer = currentspace;
-  printf("Current space is  %p with size 0x%lx\n", currentspace, heap_size);
-  printf("Next space is  %p with size 0x%lx\n", nextspace, heap_size);
+  printf("Current space is  %p with size 0x%lx\n", heap.currentspace, heap_size);
+  printf("Next space is  %p with size 0x%lx\n", heap.nextspace, heap_size);
+
+  for(int i=0; i<MAX_THREADS; i++) {
+    heap.thread_heap[i] = NULL;
+  }
+
+  heap.collection_needed = 0;
+}
+
+int alloc_init(size_t heap_size) {
+  pthread_mutex_lock(&init_lock);
+  alloc_init_global(heap_size);
+
+  // Find the stack.
+  struct GC_stack_base stb;
+  int ret = GC_get_stack_base(&stb);
+  local_heap.stack_base = stb.mem_base;
+  printf("Stack base is %p (current frame is around %p)\n", local_heap.stack_base, &ret);
+
+  for(int i=0; i < MAX_THREADS; i++) {
+    if( heap.thread_heap[i] == NULL ) {
+      heap.thread_heap[i] = &local_heap;
+      break;
+    }
+  }
+
+  pthread_mutex_unlock(&init_lock);
+
+  alloc_collect(); // This will allocate us a peice of the heap.
 
   return ret;
 }
@@ -97,65 +153,110 @@ inline static void* scanptr(void** p, void* next_alloc_pointer) {
 }
 
 int alloc_collect() {
-#ifdef DIRECT_STACK_SCAN
-  // scan stack
-  void* stack_start = __builtin_frame_address(0); //&dummy + 1; 
-  void* stack_end = stack_base;
+  int pagesize = getpagesize();
+  int master = 0;
 
-  assert(stack_end > stack_start);
-  assert((uintptr_t)stack_end % sizeof(void*) == 0);
-  assert((uintptr_t)stack_start % sizeof(void*) == 0);
+  // Start waiting for other threads
+  if( __sync_bool_compare_and_swap(&heap.collection_needed, 
+				   STATE_NOT_COLLECTING, 
+				   STATE_COLLECTION_NEEDED) ) {
+    // We are the master
+    master = 1;
 
-  printf("Scanning stack: %p - (%p) %p\n", stack_start, &stack_start, stack_end);
+    // swap spaces
+    void* tmp;
+    tmp = heap.nextspace;
+    heap.nextspace = heap.currentspace;
+    heap.currentspace = tmp;
 
-  void* next_alloc_pointer = nextspace;
+    tmp = heap.nextspace_end;
+    heap.nextspace_end = heap.currentspace_end;
+    heap.currentspace_end = tmp;
 
-  for(void** p = stack_start; p < (void**)stack_end; p++) {
-    next_alloc_pointer = scanptr(p, next_alloc_pointer);
+
+    // Wait for every other thread to be waiting for heaps.
+    local_heap.state = STATE_WAITING_FOR_COLLECTION;
+    int n_threads = 1;
+    for(int i=0; i < MAX_THREADS; i++) {
+      local_heap_t* t = heap.thread_heap[i];
+      if( t != NULL && T != local_heap ) {
+	n_threads++;
+	while(t.state != STATE_WAITING_FOR_HEAPS);
+      }
+    }
+
+    // Divide up the heap
+    size_t heap_size = heap.currentspace_end - heap.currentspace;
+    // XXX: Assumes pagesize is a power of 2.
+    size_t thread_heap_size = (heap_size/n_threads) & ~(pagesize-1);
+
+    void* next_alloc_pointer = heap.nextspace;
+    for(int i=0; i < MAX_THREADS; i++) {
+      local_heap_t* t = heap.thread_heap[i];
+      t.alloc_ptr = next_alloc_pointer;
+      t.alloc_end = next_alloc_pointer+thread_heap_size;
+      next_alloc_pointer += thread_heap_size;
+    }
+    assert(next_alloc_pointer <= heap.nextspace_end);
+
+    __sync_synchronize();
+
+    // Now we can scan
+    heap.collection_needed = STATE_HEAPS_SET;
+    local_heap.state = STATE_SCANNING;    
+  } else {
+    // Wait for master to set heaps.
+    local_heap.state = STATE_WAITING_FOR_HEAPS;
+    __sync_synchronize();
+    while(heap.collection_needed != STATE_HEAPS_SET);
+    // Now we can scan
+    local_heap.state = STATE_SCANNING;
   }
-#endif
-  void* next_alloc_pointer = nextspace;
+  
+
+  void* alloc_pointer = local_heap.alloc_pointer;
+   
+  // TODO: I'm gonna need some kind of randomized queue of things to work on
 
   // Scan Shadow stack
   for(shadow_stack_frame* frame = shadow_stack_top; frame != NULL; frame = frame->prev) {
     for(int i = 0; i < frame->length; i++) {
       void* p = frame->elements[i];
-      next_alloc_pointer = scanptr(p, next_alloc_pointer);    
+      alloc_pointer = scanptr(p, alloc_pointer);    
     }
   }
 
   // scan saved objects from roots
   printf("Scanning heap: start %p\n", nextspace);
-  for(void** scan_pointer = nextspace; scan_pointer < (void**)next_alloc_pointer; scan_pointer++) {
-    next_alloc_pointer = scanptr(scan_pointer, next_alloc_pointer);
+  for(void** scan_pointer = local_heap.alloc_pointer; scan_pointer < (void**)alloc_pointer; scan_pointer++) {
+    alloc_pointer = scanptr(scan_pointer, alloc_pointer);
   }
-  printf("Done scanning heap: stop %p\n", next_alloc_pointer);
-  
-  // swap spaces
-  void* tmp;
-  tmp = nextspace;
-  nextspace = currentspace;
-  currentspace = tmp;
-  tmp = nextspace_end;
-  nextspace_end = currentspace_end;
-  currentspace_end = tmp;
+  printf("Done scanning heap: stop %p\n", alloc_pointer);
 
-  alloc_pointer = next_alloc_pointer;
+  local_heap.alloc_pointer = alloc_pointer;  
 
   return 0;
 }
 
 void alloc_printstat() {
-  printf("Heap: %p (size %ld)  ", currentspace, currentspace_end-currentspace);
-  printf("%ld allocated, %ld free\n", alloc_pointer-currentspace, currentspace_end-alloc_pointer);
+  printf("Heap: %p (size %ld)  ", heap.currentspace, heap.currentspace_end-heap.currentspace);
+  printf("local heap: %ld free\n", local_heap.alloc_end - local_heap.alloc_ptr);
+}
+
+void alloc_safe_point() {
+  if(heap.collection_needed == STATE_COLLECTION_NEEDED) {
+    alloc_collect();
+  }
 }
 
 void* alloc(unsigned long int n) {
-  void* p = alloc_pointer + TAG_SIZE;
+  alloc_safe_point();
+
+  void* p = local_heap.alloc_ptr + TAG_SIZE;
   p = (void*)(((uintptr_t)p + alloc_align) & ~(alloc_align-1));
 
-  alloc_pointer = p + n;
-  if(alloc_pointer > currentspace_end) {
+  local_heap.alloc_ptr = p + n;
+  if(local_heap.alloc_ptr > local_heap.alloc_end) {
     alloc_collect();
     return alloc(n);
   }
