@@ -1,5 +1,6 @@
 #include "alloc.h"
 #include "shadowstack.h"
+#include "randomize.h"
 
 #include <gc/gc.h>
 #include <stdio.h>
@@ -98,6 +99,8 @@ int alloc_init(size_t heap_size) {
   pthread_mutex_lock(&init_lock);
   alloc_init_global(heap_size);
 
+  __rand((int)(uintptr_t)&heap_size);
+
   // Find the stack.
   struct GC_stack_base stb;
   int ret = GC_get_stack_base(&stb);
@@ -119,9 +122,12 @@ int alloc_init(size_t heap_size) {
 }
 
 inline static void* scanptr(void** p, void* next_alloc_pointer) {
+  // XXX: Check for thread safety.
+
   void* candidate = *p;
-  if(candidate >= currentspace && candidate < currentspace_end) {
-    //printf("Found pointer on stack: %p at %p\n", candidate, p);
+  // Check to see if the pointer is to something in the old space.
+  if(candidate >= heap.nextspace && candidate < heap.nextspace_end) {
+    printf("Found pointer: %p at %p\n", candidate, p);
     
     uintptr_t tag = TAG_OF_PTR(candidate);
       
@@ -140,6 +146,8 @@ inline static void* scanptr(void** p, void* next_alloc_pointer) {
       void* newptr = newptrtag + TAG_SIZE;
       printf("Found pointer: %p at %p copying and redirecting to %p\n", candidate, p, newptr);
       *p = newptr;
+
+      // XXX: We need to use CAS and stuff
 
       assert(!IS_FORWARDING_PTR(TAG_OF_PTR(newptr)));
       
@@ -176,25 +184,30 @@ int alloc_collect() {
 
     // Wait for every other thread to be waiting for heaps.
     local_heap.state = STATE_WAITING_FOR_COLLECTION;
+    printf("%p: Waiting for collection.\n", &local_heap);
     int n_threads = 1;
     for(int i=0; i < MAX_THREADS; i++) {
       local_heap_t* t = heap.thread_heap[i];
-      if( t != NULL && T != local_heap ) {
+      if( t != NULL && t != &local_heap ) {
 	n_threads++;
-	while(t.state != STATE_WAITING_FOR_HEAPS);
+	while(t->state != STATE_WAITING_FOR_HEAPS);
       }
     }
 
     // Divide up the heap
+    printf("%p: Dividing heap.\n", &local_heap);
     size_t heap_size = heap.currentspace_end - heap.currentspace;
     // XXX: Assumes pagesize is a power of 2.
     size_t thread_heap_size = (heap_size/n_threads) & ~(pagesize-1);
 
+    assert( thread_heap_size != 0 );
+
     void* next_alloc_pointer = heap.nextspace;
-    for(int i=0; i < MAX_THREADS; i++) {
+    for(int i=0; i < n_threads; i++) {
       local_heap_t* t = heap.thread_heap[i];
-      t.alloc_ptr = next_alloc_pointer;
-      t.alloc_end = next_alloc_pointer+thread_heap_size;
+      t->alloc_ptr = next_alloc_pointer;
+      t->alloc_end = next_alloc_pointer+thread_heap_size;
+      printf("Giving %p - %p to thread %d (%p)\n", t->alloc_ptr, t->alloc_end, i, t);
       next_alloc_pointer += thread_heap_size;
     }
     assert(next_alloc_pointer <= heap.nextspace_end);
@@ -202,38 +215,87 @@ int alloc_collect() {
     __sync_synchronize();
 
     // Now we can scan
+    printf("%p: Scanning\n", &local_heap);
     heap.collection_needed = STATE_HEAPS_SET;
     local_heap.state = STATE_SCANNING;    
   } else {
     // Wait for master to set heaps.
     local_heap.state = STATE_WAITING_FOR_HEAPS;
     __sync_synchronize();
+    printf("%p: Waiting for heap\n", &local_heap);
     while(heap.collection_needed != STATE_HEAPS_SET);
     // Now we can scan
+    printf("%p: Scanning\n", &local_heap);
     local_heap.state = STATE_SCANNING;
   }
   
 
-  void* alloc_pointer = local_heap.alloc_pointer;
+  void* alloc_pointer = local_heap.alloc_ptr;
    
-  // TODO: I'm gonna need some kind of randomized queue of things to work on
+  {
+    void* ptrQueue[8] = {NULL,};
+    int ptrQueueIdx = 0;
 
-  // Scan Shadow stack
-  for(shadow_stack_frame* frame = shadow_stack_top; frame != NULL; frame = frame->prev) {
-    for(int i = 0; i < frame->length; i++) {
-      void* p = frame->elements[i];
-      alloc_pointer = scanptr(p, alloc_pointer);    
+    // Scan Shadow stack
+    for(shadow_stack_frame* frame = shadow_stack_top; frame != NULL; frame = frame->prev) {
+      for(int i = 0; i < frame->length; i++) {
+	void* p = frame->elements[i];
+	ptrQueue[ptrQueueIdx] = p;
+	ptrQueueIdx++;
+
+	if( ptrQueueIdx >= 8 ) {
+	  random_iter(i, ptrQueue, 8) {
+	    printf("Scanning some pointer. %d\n", i);
+	    alloc_pointer = scanptr(ptrQueue[i], alloc_pointer);    
+	  }
+	}
+      }
+    }
+    
+    random_iter(i, ptrQueue, ptrQueueIdx) {
+      printf("Scanning some pointer. %d\n", i);
+      alloc_pointer = scanptr(ptrQueue[i], alloc_pointer);    
     }
   }
 
   // scan saved objects from roots
-  printf("Scanning heap: start %p\n", nextspace);
-  for(void** scan_pointer = local_heap.alloc_pointer; scan_pointer < (void**)alloc_pointer; scan_pointer++) {
-    alloc_pointer = scanptr(scan_pointer, alloc_pointer);
+  {
+    void** scan_start = local_heap.alloc_ptr;
+    printf("Scanning heap: start %p\n", scan_start);
+    for(void** scan_pointer = scan_start; scan_pointer < (void**)alloc_pointer; scan_pointer++) {
+      void** block_start = scan_pointer;
+      void** block_end = (void**)alloc_pointer;
+      //printf("Scanning block with length %ld. S\n", (uintptr_t)(block_end-block_start));
+      random_iter(i, block_start, (uintptr_t)(block_end-block_start)) {
+	printf("Scanning block with length %ld. %d\n", (uintptr_t)(block_end-block_start), i);
+	alloc_pointer = scanptr(block_start+i, alloc_pointer);
+      }
+      scan_pointer = block_end;
+    }
+    printf("Done scanning heap: stop %p\n", alloc_pointer);
   }
-  printf("Done scanning heap: stop %p\n", alloc_pointer);
 
-  local_heap.alloc_pointer = alloc_pointer;  
+  local_heap.alloc_ptr = alloc_pointer;  
+
+  local_heap.state = STATE_DONE;
+  __sync_synchronize();
+
+  printf("%p: Waiting for all others to finish\n", &local_heap);
+  if(master) {
+    for(int i=0; i < MAX_THREADS; i++) {
+      local_heap_t* t = heap.thread_heap[i];
+      if( t != NULL && t != &local_heap ) {
+	while(t->state != STATE_DONE);
+      }
+    }
+
+    heap.collection_needed = STATE_NOT_COLLECTING;
+  } else {
+    while(heap.collection_needed != STATE_NOT_COLLECTING);
+  }
+
+  printf("%p: Collection done\n", &local_heap);
+  local_heap.state = STATE_MUTATING;
 
   return 0;
 }

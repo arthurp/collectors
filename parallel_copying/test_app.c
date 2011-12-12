@@ -1,9 +1,11 @@
 #include "alloc.h"
 #include "shadowstack.h"
 
+#include <unistd.h>
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <pthread.h>
 
 void allocation_stress(long int n) {
   int *p, *prev = NULL;
@@ -135,10 +137,49 @@ void recursive_test(long int n, int d) {
   SHADOW_POP_FRAME(o);
 }
 
+static volatile int run = 1;
+
+void * thread(void *e) {
+  alloc_init(10*1000);
+  pthread_yield();
+  //while(run) {
+  allocation_stress(300);    
+    //}
+
+  alloc_safe_point();
+  sleep(1);
+  alloc_safe_point();
+
+  return NULL;
+}
+
+void run_threads(int nthreads) {
+  pthread_t threads[nthreads];
+  int rc;
+  long t;
+
+  for(t=0;t<nthreads;t++) {
+    printf("In main: creating thread %ld\n", t);
+    rc = pthread_create(&threads[t], NULL, thread, NULL);
+    if (rc){
+      printf("ERROR; return code from pthread_create() is %d\n", rc);
+      exit(-1);
+    }
+  }
+
+  sleep(2);
+
+  run = 0;
+
+  for(t=0;t<nthreads;t++) {
+    pthread_join(threads[t], NULL);
+  }
+}
+
 
 int main(int argc, char* argv[]) {
-  alloc_init(1*1000*1000);
-  alloc_printstat();
+  //alloc_init(1*1000*1000);
+  //alloc_printstat();
 
   /*allocation_stress(1000);
   alloc_printstat();
@@ -147,5 +188,9 @@ int main(int argc, char* argv[]) {
 
   alloc_printstat();*/
 
-  recursive_test(3, 0);
+  //recursive_test(3, 0);
+  
+  //random_test();
+  
+  run_threads(atoi(argv[1]));
 }

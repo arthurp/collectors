@@ -4,7 +4,7 @@ LDLIBS=-lgc
 
 all : test_app
 
-test_app: test_app.c alloc.c shadowstack.c
+test_app: test_app.c alloc.c shadowstack.c randomize.c
 
 check-syntax:
 	$(CC) $(CFLAGS) -o nul -fsyntax-only -S ${CHK_SOURCES}
