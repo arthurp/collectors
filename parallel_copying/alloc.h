@@ -1,6 +1,7 @@
 #include <stdlib.h>
 
 int alloc_init();
+void alloc_fini();
 int alloc_collect();
 void alloc_printstat();
 

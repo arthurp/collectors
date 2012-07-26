@@ -11,6 +11,9 @@
 #include <string.h>
 
 #include <pthread.h>
+#include <sched.h>
+
+#define YIELD() sched_yield()
 
 const int alloc_align = 16;
 
@@ -59,7 +62,7 @@ __thread local_heap_t local_heap = {0,};
 typedef struct { 
   volatile int collection_needed;
 
-  /* Protected by init_lock */
+  /* Protected by collector_lock */
   void* currentspace;
   void* currentspace_end;
   
@@ -70,7 +73,9 @@ typedef struct {
 } global_heap_t;
 
 global_heap_t heap = {0,NULL,};
-pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
+
+pthread_mutex_t collector_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_barrier_t collector_barrier;
 
 void alloc_init_global(size_t heap_size) {
   if( heap.currentspace != NULL ) 
@@ -96,7 +101,11 @@ void alloc_init_global(size_t heap_size) {
 }
 
 int alloc_init(size_t heap_size) {
-  pthread_mutex_lock(&init_lock);
+  while( pthread_mutex_trylock(&collector_lock) != 0 ) {
+    alloc_safe_point();
+    YIELD();
+  }
+
   alloc_init_global(heap_size);
 
   __rand((int)(uintptr_t)&heap_size);
@@ -107,18 +116,43 @@ int alloc_init(size_t heap_size) {
   local_heap.stack_base = stb.mem_base;
   printf("Stack base is %p (current frame is around %p)\n", local_heap.stack_base, &ret);
 
-  for(int i=0; i < MAX_THREADS; i++) {
+  for(int i = 0; i < MAX_THREADS; i++) {
     if( heap.thread_heap[i] == NULL ) {
       heap.thread_heap[i] = &local_heap;
       break;
     }
   }
 
-  pthread_mutex_unlock(&init_lock);
+  pthread_mutex_unlock(&collector_lock);
 
   alloc_collect(); // This will allocate us a peice of the heap.
 
   return ret;
+}
+
+void alloc_fini() {
+  while( pthread_mutex_trylock(&collector_lock) != 0 ) {
+    alloc_safe_point();
+    YIELD();
+  }
+
+  // Find the thread we are removing
+  int i = 0;
+  for(; i < MAX_THREADS; i++) {
+    if( heap.thread_heap[i] == &local_heap ) {
+      heap.thread_heap[i] = NULL;
+      break;
+    }
+  }
+  // Shift all the later threads down
+  for(; i < MAX_THREADS-1; i++) {
+    heap.thread_heap[i] = heap.thread_heap[i+1];
+  }
+  // Null the last thread. It will by definition be empty and may
+  // still have an old non-null value.
+  heap.thread_heap[MAX_THREADS-1] = NULL;
+
+  pthread_mutex_unlock(&collector_lock);
 }
 
 inline static void* scanptr(void** p, void* next_alloc_pointer) {
@@ -164,10 +198,14 @@ int alloc_collect() {
   int pagesize = getpagesize();
   int master = 0;
 
+  // collector_barrier
+
   // Start waiting for other threads
   if( __sync_bool_compare_and_swap(&heap.collection_needed, 
 				   STATE_NOT_COLLECTING, 
-				   STATE_COLLECTION_NEEDED) ) {
+				   STATE_COLLECTION_NEEDED)  ) {
+    pthread_mutex_lock(&collector_lock);
+    
     // We are the master
     master = 1;
 
@@ -190,7 +228,7 @@ int alloc_collect() {
       local_heap_t* t = heap.thread_heap[i];
       if( t != NULL && t != &local_heap ) {
 	n_threads++;
-	while(t->state != STATE_WAITING_FOR_HEAPS);
+	while(t->state != STATE_WAITING_FOR_HEAPS) YIELD();
       }
     }
 
@@ -223,7 +261,7 @@ int alloc_collect() {
     local_heap.state = STATE_WAITING_FOR_HEAPS;
     __sync_synchronize();
     printf("%p: Waiting for heap\n", &local_heap);
-    while(heap.collection_needed != STATE_HEAPS_SET);
+    while(heap.collection_needed != STATE_HEAPS_SET) YIELD();
     // Now we can scan
     printf("%p: Scanning\n", &local_heap);
     local_heap.state = STATE_SCANNING;
@@ -285,24 +323,27 @@ int alloc_collect() {
     for(int i=0; i < MAX_THREADS; i++) {
       local_heap_t* t = heap.thread_heap[i];
       if( t != NULL && t != &local_heap ) {
-	while(t->state != STATE_DONE);
+	while(t->state != STATE_DONE) YIELD();
       }
     }
 
     heap.collection_needed = STATE_NOT_COLLECTING;
+    __sync_synchronize();
+    pthread_mutex_unlock(&collector_lock);
   } else {
-    while(heap.collection_needed != STATE_NOT_COLLECTING);
+    while(heap.collection_needed != STATE_NOT_COLLECTING && heap.collection_needed != STATE_COLLECTION_NEEDED) YIELD();
   }
 
   printf("%p: Collection done\n", &local_heap);
   local_heap.state = STATE_MUTATING;
+  __sync_synchronize();
 
   return 0;
 }
 
 void alloc_printstat() {
   printf("Heap: %p (size %ld)  ", heap.currentspace, heap.currentspace_end-heap.currentspace);
-  printf("local heap: %ld free\n", local_heap.alloc_end - local_heap.alloc_ptr);
+  printf("local heap: %p end (%ld free)\n", local_heap.alloc_end, local_heap.alloc_end - local_heap.alloc_ptr);
 }
 
 void alloc_safe_point() {

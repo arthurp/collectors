@@ -7,6 +7,8 @@
 #include <assert.h>
 #include <pthread.h>
 
+void recursive_test(long int n, int d);
+
 void allocation_stress(long int n) {
   int *p, *prev = NULL;
 
@@ -22,8 +24,10 @@ void allocation_stress(long int n) {
     if(prev != NULL)
       assert(*prev == i-1);
 
+    recursive_test(2, 9);
+
     prev = p;
-    alloc_printstat();
+    //alloc_printstat();
   }
 
   SHADOW_POP_FRAME(o);
@@ -120,7 +124,7 @@ void recursive_test(long int n, int d) {
   SHADOW_END(o);
   
   for(int i=0; i < n; i++) {
-    printf("%d %d\n", d, i);
+    //printf("%d %d\n", d, i);
 
     p = alloc(100);
     *p = i;
@@ -131,6 +135,9 @@ void recursive_test(long int n, int d) {
       assert(*prev == i-1);
     assert(*p == i);
 
+    if(((((intptr_t)p>>10) ^ ((intptr_t)p>>20) ^ ((intptr_t)p>>11) ^ ((intptr_t)p>>15)) % 10) & 0x1)
+      sched_yield();
+
     prev = p;
   }
 
@@ -140,15 +147,13 @@ void recursive_test(long int n, int d) {
 static volatile int run = 1;
 
 void * thread(void *e) {
-  alloc_init(10*1000);
+  alloc_init(2000*1000);
   pthread_yield();
   //while(run) {
-  allocation_stress(300);    
+  allocation_stress(3000000);    
     //}
 
-  alloc_safe_point();
-  sleep(1);
-  alloc_safe_point();
+  alloc_fini();
 
   return NULL;
 }
@@ -167,7 +172,7 @@ void run_threads(int nthreads) {
     }
   }
 
-  sleep(2);
+  //sleep(2);
 
   run = 0;
 
